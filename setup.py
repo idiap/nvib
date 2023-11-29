@@ -10,8 +10,8 @@ import setuptools
 
 setuptools.setup(
     name="nvib",
-    version="0.1",
-    description="Nonparametric variational information bottleneck for Transformers",
+    version="0.2",
+    description="Nonparametric Variational Information Bottleneck layer for Transformers",
     url="#",
     author="Fabio J Fehr",
     install_requires=["torch"],

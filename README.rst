@@ -10,13 +10,15 @@
 Nonparametric Variational Information Bottleneck (NVIB)
 ================================================================================================================
 
-[Paper_]
+[Paper1_][Paper2_]
 
 .. image:: figures/nvib_denoising.png
 
 
-The NVIB Python package containing the NVIB layer, KL divergence loss functions and the Denoising attention module. This
-is the package for the paper `A Variational AutoEncoder for Transformers with Nonparametric Variational Information Bottleneck`__
+The NVIB Python package containing the NVIB layer and the Denoising attention module. This is the package for the papers:
+
+- `A Variational AutoEncoder for Transformers with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=6QkjC_cs03X>`_
+- `Learning to Abstract with Nonparametric Variational Information Bottleneck <https://arxiv.org/abs/2310.17284>`_
 
 Please cite the original authors for their work in any publication(s) that uses this work:
 
@@ -30,17 +32,27 @@ Please cite the original authors for their work in any publication(s) that uses 
     url={https://openreview.net/forum?id=6QkjC_cs03X}
     }
 
+    @misc{behjati2023learning,
+      author={Melika Behjati and Fabio Fehr and James Henderson},
+      title={Learning to Abstract with Nonparametric Variational Information Bottleneck}, 
+      year={2023},
+      eprint={2310.17284},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2310.17284}
+    }
+
 Description
 ------------
 
-The NVIB project containing the NVIB layer, KL divergence loss functions and the Denoising attention module.
+The NVIB project containing the NVIB layer and the Denoising attention module.
 
 
 Requirements
 -------------
 
 - Python 3.9
-- PyTorch 1.10.0
+- PyTorch 2.0.0
 - math 
 
 
@@ -57,13 +69,16 @@ Clone this repository.  Activate your environment and install this package local
 Project status
 ----------------
 
+V2 Improvements:
+
+- Implicit reparamerisation gradients
+- KL divergence functions are methods of the NVIB layer class
+- Update to Pytorch 2.0.0
+
 Development is ongoing and soon to have implementations for: 
 
 - Denoising attention for multihead attention
-- Implicit reparamerisation gradients
-- KL divergence functions are methods of the NVIB layer class
 - Initialisations
-- Update to Pytorch.1.13.0
 
 Python Usage
 -------------------
@@ -73,7 +88,6 @@ Import the package and its components
 .. code:: python
 
     from nvib.nvib_layer import Nvib
-    from nvib.kl import kl_gaussian, kl_dirichlet
     from nvib.denoising_attention import DenoisingMultiheadAttention
 
 For running the following examples:
@@ -101,9 +115,9 @@ Initialise the NVIB layer (Source length = :math:`N_s`, embedding size = :math:`
 
 - `size_in` The embedding size input
 - `size_out` The embedding size output (typically the same)
-- `prior_mu` Prior for Gaussian means :math:`\mu^p`
-- `prior_var` Prior for Gaussian variance :math:`(\sigma^2)^p`
-- `prior_alpha` Prior for Dirichlet psuedo-counts :math:`\alpha_0^p`
+- `prior_mu` Torch tensor of size_in Prior for Gaussian means :math:`\mu^p` if None then :math:`\mu^p = 0`
+- `prior_var` Torch tensor of size_in  Prior for Gaussian variance :math:`(\sigma^2)^p` if None then :math:`(\sigma^2)^p = 1`
+- `prior_alpha` Torch tensor of 1 Prior for Dirichlet psuedo-counts :math:`\alpha_0^p` if None then :math:`\alpha_0^p = 1`
 - `delta` Conditional prior :math:`\alpha^\Delta` - Proportion of vectors you would like to retain 
 - `kappa` Number of samples per component :math:`\kappa^\Delta`
 
@@ -115,9 +129,9 @@ Initialise the NVIB layer (Source length = :math:`N_s`, embedding size = :math:`
 
     nvib_layer = Nvib(size_in=H,
                   size_out=H,
-                  prior_mu=0,
-                  prior_var=1,
-                  prior_alpha=1,
+                  prior_mu=None,
+                  prior_var=None,
+                  prior_alpha=None,
                   delta=1,
                   kappa=1)
 
@@ -127,10 +141,10 @@ token.
 
 .. code:: python
 
-    latent_dict = nvib_layer(encoder_output, src_key_padding_mask)
+    latent_dict = nvib_layer(encoder_output, src_key_padding_mask, alpha_skip=None)
 
 
-The dictionary returned is of the form:
+The alpha_skip input can be used to pass the previous layers `alpha`. The dictionary returned is of the form:
 
 `{z,pi,memory_key_padding_mask,mu,logvar,alpha}`
 
@@ -205,11 +219,11 @@ KL functions
 --------------
 
 Simple implementation for KL divergence between univariate Gaussians tensors augmented with weights from our
-psuedo-counts :math:`\alpha` (see paper for more details). **Note:** Remember to set the priors here.
+psuedo-counts :math:`\alpha` (see paper for more details).
 
 .. code:: python
 
-    kl_g = kl_gaussian(**latent_dict, prior_mu=0, prior_var=1, kappa=1)
+    kl_g = nvib_layer.kl_gaussian(**latent_dict)
 
 where `mu`, `logvar`, `alpha` and the `memory_key_padding_mask` come from NVIB layer latent dict and priors and number of 
 samples :math:`\kappa^\Delta` are set. The output is a KL loss of  dimension (B).
@@ -218,7 +232,7 @@ The KL divergence between Dirichlet components (see paper for more details).
 
 .. code:: python
 
-    kl_d = kl_dirichlet(**latent_dict, prior_alpha=1, delta=1, kappa=1)
+    kl_d = nvib_layer.kl_dirichlet(**latent_dict)
 
 where `alpha` and the `memory_key_padding_mask` come from NVIB layer latent dict and priors and number of 
 samples :math:`\kappa^\Delta` are set. The output is a KL loss of dimension (B).
@@ -233,7 +247,6 @@ Repository Structure
     ├── nvib
     │   ├── __init__.py
     │   ├── denoising_attention.py
-    │   ├── kl.py
     │   └── nvib_layer.py
     ├── README.rst
     └── setup.py
@@ -242,8 +255,8 @@ Repository Structure
 
 Contact
 ---------
-For questions or reporting issues to this software package, kindly contact the second author_.
+For questions or reporting issues to this software package, kindly contact the author_.
 
-.. _author: fabio.fehr@idiap
-.. _Paper: https://openreview.net/forum?id=6QkjC_cs03X
-__ https://openreview.net/forum?id=6QkjC_cs03X
+.. _author: fabio.fehr@idiap.ch
+.. _Paper1: https://openreview.net/forum?id=6QkjC_cs03X
+.. _Paper2: https://arxiv.org/abs/2310.17284

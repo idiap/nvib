@@ -10,26 +10,9 @@
 # It assumes keys and values (encoder output) are a tuple (vector, pi, mu, logvar) where vector is either key or value
 # These are then included into the attention function.
 
-# This is how my pytorch model uses this:
-
-# # Pytorch implementation
-# Transformer decoder:
-# decoder_layer = nn.TransformerDecoderLayer(d_model=args.DIM_H,
-#                                            dim_feedforward=args.DIM_H,
-#                                            nhead=args.NUM_HEADS,
-#                                            dropout=args.DROPOUT if args.NUM_LAYERS > 1 else 0)
-# self.transformer_decoder = nn.TransformerDecoder(decoder_layer,
-#                                                  num_layers=args.NUM_LAYERS)
-
-# Set each layer which interfaces encoder and decoder to my custom one:
-# for layer_num, layer in enumerate(self.transformer_decoder.layers):
-#     layer.multihead_attn = DenoisingMultiheadAttention(embed_dim=args.DIM_H,
-#                                                        num_heads=args.NUM_HEADS,
-#                                                        dropout=args.DROPOUT,
-#                                                        bias=False)
 
 # Derive formulation for correct U space projection - assume B,Ns,H
-#  torch.bmm(q, k.transpose(-2, -1)) == torch.bmm(((query@w_q.T).transpose(0,1)), ((key@w_k.T).transpose(0,1)).transpose(-2, -1))
+#  torch.bmm(q, k.transpose(-2, -1)) == torch.bmm(((query@w_q.T).transpose(0,1)), ((key@w_k.T).!transpose(0,1)).transpose(-2, -1))
 #                                    == torch.bmm(((query.transpose(0,1)@w_q.T)), ((key.transpose(0,1)@w_k.T)).transpose(-2, -1))
 #                                    == (((query.transpose(0,1)@w_q.T)) @ ((key.transpose(0,1)@w_k.T)).transpose(-2, -1))
 #                                    == (((query.transpose(0,1)@w_q.T)) @ w_k @ key.transpose(0,1).transpose(-2,-1))
@@ -158,7 +141,10 @@ def _in_projection(
         Eq,
         Eq,
     ), f"expecting query weights shape of {(Eq, Eq)}, but got {w_q.shape}"
-    assert w_k.shape == (Eq, Ek), f"expecting key weights shape of {(Eq, Ek)}, but got {w_k.shape}"
+    assert w_k.shape == (
+        Eq,
+        Ek,
+    ), f"expecting key weights shape of {(Eq, Ek)}, but got {w_k.shape}"
     assert w_v.shape == (
         Eq,
         Ev,
@@ -206,15 +192,24 @@ def scaled_dot_product_attention_training(
             and E is embedding dimension.
         - attn_mask: either a 3D tensor of shape :math:`(B, Nt, Ns)` or a 2D tensor of
             shape :math:`(Nt, Ns)`.
+        - pi: :math:`(Ns, B, 1)` where B is batch size, Nt is the target sequence length
+        - Z: :math:`(Ns, B, p) where Ns is the source sequence length, B is batch size, and
+            p is the embedding before projection and heads`
 
         - Output: attention values have shape :math:`(B, Nt, E)`; attention weights
             have shape :math:`(B, Nt, Ns)`
     """
 
-    B, Nt, E = q.shape
+    H, Nt, E = q.shape  # split over batches E is D / H
+    Ns, B, P = Z.shape  # not split over batches
+    nheads = int(H / B)
+
     q = q / math.sqrt(E)
     # (B, Nt, E) x (B, E, Ns) -> (B, Nt, Ns)
     attn = torch.bmm(q, k.transpose(-2, -1))
+
+    # Repeat pi over B dim for heads
+    pi = pi.repeat(1, nheads, 1)
 
     # where pi is zero include it to the attention mask
     pi_attn_mask = torch.zeros_like(pi.permute(1, 2, 0), dtype=torch.float)
@@ -222,9 +217,10 @@ def scaled_dot_product_attention_training(
     attn_mask += pi_attn_mask
 
     # Include bias terms repeated over Nt dimension
-    l2_norm = 0.5 * (torch.norm(Z, dim=-1)).T.unsqueeze(1) ** 2
-    l2_norm = l2_norm / math.sqrt(E)  # Scale by sqrt(dk)
-    attn -= l2_norm
+    l2_norm = 0.5 * (torch.norm(Z, dim=-1)).transpose(1, 0).unsqueeze(1) ** 2
+
+    l2_norm = l2_norm / math.sqrt(E)  # Scale by sqrt(dk) TODO: maybe this should be P?
+    attn -= l2_norm.repeat(nheads, 1, 1)  # Repeat over heads
     pi = torch.clamp(pi.clone(), min=1e-8).permute(1, 2, 0)  # Make sure its above zero
     attn += torch.log(pi)
 
@@ -232,8 +228,8 @@ def scaled_dot_product_attention_training(
         attn += attn_mask
     attn = softmax(attn, dim=-1)
     # TODO: TRY WITHOUT DROPOUT
-    # if dropout_p > 0.0:
-    #     attn = dropout(attn, p=dropout_p)
+    if dropout_p > 0.0:
+        attn = dropout(attn, p=dropout_p)
     # (B, Nt, Ns) x (B, Ns, E) -> (B, Nt, E)
     output = torch.bmm(attn, v)
     return output, attn
@@ -241,10 +237,12 @@ def scaled_dot_product_attention_training(
 
 def scaled_dot_product_attention_evaluation(
     projected_u: Tensor,
+    projected_b: Tensor,
     mu: Tensor,
     logvar: Tensor,
     pi: Tensor,
     w_v: Tensor,
+    b_v: Tensor,
     key_padding_mask: Tensor,
     attn_mask: Optional[Tensor] = None,
     dropout_p: float = 0.0,
@@ -252,35 +250,47 @@ def scaled_dot_product_attention_evaluation(
     """
     At evalutation time the denoising attention values are an interpolation between each mean and the query
 
-    :param projected_u: [B,Nt,H]
-    :param mu: [Ns,B,H]
-    :param logvar: [Ns,B,H]
+    :param projected_u: [B,H,Nt,P] where H heads and P is the embedding dimension before QKV projection
+    :param mu: [Ns,B,P]
+    :param logvar: [Ns,B,P]
     :param pi: [Ns,B,1]
-    :param w_v: [H,H] assuming square projection
-    :param key_padding_mask:
+    :param w_v: [H,E, P]
+    :param b_v: [B*H,1]
+    :param key_padding_mask: [B*H,1,Ns]
     :param attn_mask: [B,1,Ns] broadcast over the Nt dimension
     :param dropout_p:
-    :return:
+    :return: attention values have shape :math:`(B, Nt, E)`;
+             attention weights have shape :math:`(B, Nt, Ns)`
     """
 
-    # TODO: Multihead consideration here
-    prior_var_u = math.sqrt(projected_u.size(-1))
-    # Transform all in to [Bs,Ns,..]
+    B, H, Nt, P = projected_u.shape
+    Ns, B, P = mu.shape
+    E = int(P / H)
+    H, E, P = w_v.shape
+
+    prior_var_u = math.sqrt(E)
+
+    # Transform all in to [B,Ns,..]
     mu = mu.transpose(0, 1)
     pi = pi.transpose(0, 1)
     logvar = logvar.transpose(0, 1)
+    key_padding_mask = key_padding_mask.permute(0, 2, 1)  # [B*H,Ns,1]
 
     var = torch.exp(logvar)
     biased_var = var + prior_var_u
 
+    # Repeat pi over B dim for heads
+    pi = pi.repeat(H, 1, 1)
     # where pi is zero include it to the attention mask
     pi_attn_mask = torch.zeros_like(pi.permute(0, 2, 1), dtype=torch.float)
-    pi_attn_mask.masked_fill_(pi.permute(0, 2, 1).le(0), float("-inf"))
+    pi_attn_mask.masked_fill_(
+        pi.permute(0, 2, 1).le(0), float("-inf")
+    )  # TODO: le(threshold)
     attn_mask += pi_attn_mask
+    attn_mask = attn_mask.view(B, H, 1, Ns)
 
-    # Attention term (masked by mu)
-    # (B, Nt, E) x (B, E, Ns) -> (B, Nt, Ns)
-    attn = torch.bmm(projected_u, mu.permute(0, 2, 1) / biased_var.permute(0, 2, 1))
+    # Project back from the p space to the Q.K attention matrix
+    attn = torch.einsum("bhmp, bnp -> bhmn", projected_u, mu / biased_var) + projected_b
 
     #
     # (light breath) include bias terms
@@ -288,17 +298,26 @@ def scaled_dot_product_attention_evaluation(
 
     # Alpha term
     pi = torch.clamp(pi.clone(), min=1e-8)  # Make sure its above zero
-    t1 = torch.log(pi).masked_fill_(key_padding_mask.permute(0, 2, 1), 0)  # [B,Ns,1]
+    t1 = torch.log(pi).masked_fill_(key_padding_mask, 0)  # [B*H,Ns,1]
+
     # L2 norm term
-    t2 = 0.5 * ((torch.norm((mu / torch.sqrt(biased_var)), dim=-1)).unsqueeze(-1) ** 2)  # [B,Ns,1]
+    t2 = 0.5 * ((torch.norm((mu / torch.sqrt(biased_var)), dim=-1)) ** 2).unsqueeze(
+        -1
+    ).repeat(
+        H, 1, 1
+    )  # [B*H,Ns,1]
+
     # Variance penalty term
     t3 = torch.sum(
-        torch.log(biased_var).masked_fill_(key_padding_mask.permute(0, 2, 1), 0), dim=-1
+        torch.log(biased_var).repeat(H, 1, 1).masked_fill_(key_padding_mask, 0), dim=-1
     ).unsqueeze(
         -1
-    )  # [B,Ns,1]
-    # # Bias terms into attention (broadcasted)
-    attn = attn + (t1 - t2 - t3).permute(0, 2, 1)
+    )  # [B*H,Ns,1]
+
+    bias_term = (t1 - t2 - t3).view(B, H, Ns, 1).permute(0, 1, 3, 2)  # [B,H,1,Ns]
+
+    # Bias terms into attention copied over heads broadcasted over Nt
+    attn = attn + bias_term
 
     # Mask and softmax
     if attn_mask is not None:
@@ -308,14 +327,23 @@ def scaled_dot_product_attention_evaluation(
         attn = dropout(attn, p=dropout_p)
 
     # Interpolate attention between Z and projected query
-    output = torch.bmm(attn, (var / biased_var)) * projected_u + torch.bmm(
-        attn, ((prior_var_u / biased_var) * mu)
+    output = torch.einsum(
+        "bhmn, bnp -> bhmp", attn, (var / biased_var)
+    ) * projected_u + torch.einsum(
+        "bhmn, bnp -> bhmp", attn, ((prior_var_u / biased_var) * mu)
     )
 
     # Project into the correct space
-    output = output @ w_v.T
+    output = (
+        (
+            torch.einsum("bhmp, hep -> bhme", output, w_v)
+            + torch.einsum("bhmp, hep -> bhme", attn, b_v)
+        )
+        .contiguous()
+        .view(B * H, Nt, E)
+    )
 
-    return output, attn
+    return output, attn.contiguous().view(B * H, Nt, Ns)
 
 
 # COPIED FROM torch.nn.functional
@@ -429,9 +457,15 @@ class DenoisingMultiheadAttention(Module):
         ), "embed_dim must be divisible by num_heads"
 
         if self._qkv_same_embed_dim is False:
-            self.q_proj_weight = Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
-            self.k_proj_weight = Parameter(torch.empty((embed_dim, self.kdim), **factory_kwargs))
-            self.v_proj_weight = Parameter(torch.empty((embed_dim, self.vdim), **factory_kwargs))
+            self.q_proj_weight = Parameter(
+                torch.empty((embed_dim, embed_dim), **factory_kwargs)
+            )
+            self.k_proj_weight = Parameter(
+                torch.empty((embed_dim, self.kdim), **factory_kwargs)
+            )
+            self.v_proj_weight = Parameter(
+                torch.empty((embed_dim, self.vdim), **factory_kwargs)
+            )
             self.register_parameter("in_proj_weight", None)
         else:
             self.in_proj_weight = Parameter(
@@ -490,6 +524,7 @@ class DenoisingMultiheadAttention(Module):
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
         attn_mask: Optional[Tensor] = None,
+        average_attn_weights: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""
         Args:
@@ -553,6 +588,7 @@ class DenoisingMultiheadAttention(Module):
                 q_proj_weight=self.q_proj_weight,
                 k_proj_weight=self.k_proj_weight,
                 v_proj_weight=self.v_proj_weight,
+                average_attn_weights=average_attn_weights,
             )
         else:
             attn_output, attn_output_weights = denoising_multi_head_attention_forward(
@@ -573,6 +609,7 @@ class DenoisingMultiheadAttention(Module):
                 key_padding_mask=key_padding_mask,
                 need_weights=need_weights,
                 attn_mask=attn_mask,
+                average_attn_weights=average_attn_weights,
             )
         if self.batch_first:
             return attn_output.transpose(1, 0), attn_output_weights
@@ -604,6 +641,7 @@ def denoising_multi_head_attention_forward(
     v_proj_weight: Optional[Tensor] = None,
     static_k: Optional[Tensor] = None,
     static_v: Optional[Tensor] = None,
+    average_attn_weights: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     r"""
     Args:
@@ -750,7 +788,15 @@ def denoising_multi_head_attention_forward(
         else:
             b_q, b_k, b_v = in_proj_bias.chunk(3)
         q, k, v = _in_projection(
-            query, key, value, q_proj_weight, k_proj_weight, v_proj_weight, b_q, b_k, b_v
+            query,
+            key,
+            value,
+            q_proj_weight,
+            k_proj_weight,
+            v_proj_weight,
+            b_q,
+            b_k,
+            b_v,
         )
 
     # prep attention mask
@@ -779,7 +825,9 @@ def denoising_multi_head_attention_forward(
                     f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
                 )
         else:
-            raise RuntimeError(f"attn_mask's dimension {attn_mask.dim()} is not supported")
+            raise RuntimeError(
+                f"attn_mask's dimension {attn_mask.dim()} is not supported"
+            )
 
     # prep key padding mask
     if key_padding_mask is not None and key_padding_mask.dtype == torch.uint8:
@@ -832,8 +880,12 @@ def denoising_multi_head_attention_forward(
     # add zero attention along batch dimension (now first)
     if add_zero_attn:
         zero_attn_shape = (bsz * num_heads, 1, head_dim)
-        k = torch.cat([k, torch.zeros(zero_attn_shape, dtype=k.dtype, device=k.device)], dim=1)
-        v = torch.cat([v, torch.zeros(zero_attn_shape, dtype=v.dtype, device=v.device)], dim=1)
+        k = torch.cat(
+            [k, torch.zeros(zero_attn_shape, dtype=k.dtype, device=k.device)], dim=1
+        )
+        v = torch.cat(
+            [v, torch.zeros(zero_attn_shape, dtype=v.dtype, device=v.device)], dim=1
+        )
         if attn_mask is not None:
             attn_mask = pad(attn_mask, (0, 1))
         if key_padding_mask is not None:
@@ -871,58 +923,83 @@ def denoising_multi_head_attention_forward(
         dropout_p = 0.0
 
     # Reminder:
-    # k == v [B,Ns,H]
-    # q [B,Nt,H]
-    # key == value [Ns,B,H]
-    # query [Nt,B,H]
+    # k == v [B*H,Ns,D/H]
+    # q [B*H,Nt,D/H]
+    # key == value [Ns,B,P]
+    # query [Nt,B,P]
 
     # pi [Ns,B,1]
-    # mu [Ns,B,H]
-    # logvar [Ns,B,H]
+    # mu [Ns,B,P]
+    # logvar [Ns,B,P]
 
-    # TODO: Multihead
     if training:
-
         #
         # (deep breath) calculate attention and out projection
         #
 
-        # [B,Nt, H]
+        # [B*H,Nt, D/H]
         attn_output, attn_output_weights = scaled_dot_product_attention_training(
             q, k, v, pi, key, attn_mask, dropout_p
         )
 
         # Reverse multiheads
-        # attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
-        # [Nt,B,H]
-        attn_output = attn_output.transpose(0, 1)
+        attn_output = (
+            attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        )  # [Nt,B,D]
 
     else:
-
         # TRAINING TIME FUNCTION
         # attn_output, attn_output_weights = scaled_dot_product_attention_training(q, k, v,
         #                                                                          pi, key,
         #                                                                          attn_mask,
         #                                                                          dropout_p)
 
-        # Project queries into key space (derivation at top of script)
-        w_q, w_k, w_v = in_proj_weight.split([embed_dim, embed_dim, embed_dim])
-        projected_u = q @ w_k  # [B,Nt,H]
+        # Get weights
+        _, w_k, w_v = in_proj_weight.split([embed_dim, embed_dim, embed_dim])
+        if in_proj_bias is None:
+            b_q = b_k = b_v = None
+        else:
+            b_q, b_k, b_v = in_proj_bias.chunk(3)
+
+        # Reshape the multihead query and weights
+        mh_w_k = w_k.view(num_heads, head_dim, -1)  # [heads, d/head, p]
+        mh_w_v = w_v.view(num_heads, head_dim, -1)  # [heads, d/head, p]
+        mh_b_v = b_v.view(num_heads, head_dim).unsqueeze(-1)  # [heads, d/head, 1]
+        mh_b_k = b_k.view(num_heads, head_dim).unsqueeze(-1)  # [heads, d/head, 1]
+        q_reshape = q.view(bsz, num_heads, tgt_len, head_dim)  # [B, heads, Nt, d/head]
+
+        # Project the multihead query and bias into the p space from the e (d/head) space
+        projected_u = torch.einsum("bhme, hep -> bhmp", q_reshape, mh_w_k)
+        projected_bias = torch.einsum("bhme, hep -> bhmp", q_reshape, mh_b_k)
 
         attn_output, attn_output_weights = scaled_dot_product_attention_evaluation(
-            projected_u, mu, logvar, pi, w_v, key_padding_mask, attn_mask, dropout_p
+            projected_u,
+            projected_bias,
+            mu,
+            logvar,
+            pi,
+            mh_w_v,
+            mh_b_v,
+            key_padding_mask,
+            attn_mask,
+            dropout_p,
         )
 
         # Reverse multiheads
-        # attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
-        attn_output = attn_output.transpose(0, 1)
+        attn_output = (
+            attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        )  # [Nt,B,D]
 
     # output projection
     attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
 
     if need_weights:
-        # average attention weights over heads
         attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-        return attn_output, attn_output_weights.sum(dim=1) / num_heads
+        # Average attention weights over heads
+        if average_attn_weights:
+            attn_output_weights = attn_output_weights.sum(dim=1) / num_heads
+        # Return all attention weights
+        else:
+            return attn_output, attn_output_weights
     else:
         return attn_output, None

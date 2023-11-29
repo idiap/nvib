@@ -6,8 +6,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
 
-import math
-
 import torch
 import torch.nn as nn
 
@@ -19,44 +17,16 @@ import torch.nn as nn
 # H: hidden dimension
 
 
-def inverse_cdf_approximation(alpha):
+class Exponential(nn.Module):
     """
-    Takes in alpha values and uses them to calculate the INVCDF approximation to the Gamma
-    GammaDist = 1/b * (u * a * gammaFunc(a)) ** (1/a)
-    Took logs in the calculation to prevent overflow!
-    b = beta = 1
-
-    Nota Bene: This approximation is only good when alphas are small (roughly less than 1)
-    :param alpha: positive values
-    :return: gamma variables
+    Simple exponential activation function
     """
 
-    u_obj = torch.distributions.uniform.Uniform(0 + 1e-8, 1 - 1e-8)
-    u = u_obj.sample(alpha.size()).to(alpha.device)
-    gammas = torch.exp((1 / alpha) * (torch.log(u) + torch.log(alpha) + torch.lgamma(alpha)))
+    def __init__(self):
+        super().__init__()
 
-    return gammas
-
-
-def gauss_approximation(alpha):
-    """
-    Takes in alpha values and uses them to calculate the gaussian reparameterisation approximation to the Gamma
-    G ~ N(a, sqrt(a))
-    a = mean
-    a^2 = variance
-
-     Nota Bene: This approximation is only good when alphas are large (roughly greater than 10)
-    :param alpha: positive values
-    :return: gamma variables
-    """
-
-    # Training the alphas have noise
-    std = torch.sqrt(alpha)
-    eps = torch.randn_like(std)
-    gammas = eps.mul(std).add_(alpha)
-    gammas = torch.clamp(gammas, min=1e-8)  # Make sure they are not negative
-
-    return gammas
+    def forward(self, x):
+        return torch.exp(x)
 
 
 class Nvib(nn.Module):
@@ -64,26 +34,49 @@ class Nvib(nn.Module):
     A Nonparameteric variational information bottleneck layer
     """
 
-    def __init__(self, size_in, size_out, prior_mu, prior_var, prior_alpha, delta, kappa):
+    def __init__(
+        self,
+        size_in,
+        size_out,
+        prior_mu=None,
+        prior_var=None,
+        prior_alpha=None,
+        delta=1,
+        kappa=1,
+        nheads=1,
+    ):
         super().__init__()
 
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         # Priors
-        self.prior_mu = float(prior_mu)
-        self.prior_var = float(prior_var)
-        self.prior_alpha = float(prior_alpha)
+        self.prior_mu = (prior_mu if prior_mu is not None else torch.zeros(size_in)).to(
+            self.device
+        )  # [H]
+        self.prior_var = (
+            prior_var if prior_var is not None else torch.ones(size_in)
+        ).to(
+            self.device
+        )  # [H]
+        self.prior_alpha = (
+            prior_alpha if prior_alpha is not None else torch.ones(1)
+        ).to(
+            self.device
+        )  # [1]
         self.delta = float(delta)  # Conditional prior delta
         self.kappa = int(kappa)  # Number of samples
 
         # Layers for parameters
         self.size_in = size_in
         self.size_out = size_out
-        self.relu_activation = nn.ReLU()  # Relu for alphas
+        self.alpha_activation = Exponential()  # activation for alphas
         self.mu_proj = nn.Linear(size_in, size_out)  # Project to mean
         self.logvar_proj = nn.Linear(size_in, size_out)  # Project log variance
         self.alpha_proj = nn.Linear(size_in, 1)  # Project to model size
+        self.d = size_in / nheads  # dimension of the head
 
     def reparameterize_gaussian(self, mu, logvar):
-
         """
         Reparameterise for gaussian
         Train = sample
@@ -103,11 +96,8 @@ class Nvib(nn.Module):
         return z  # [Nl,B,H]
 
     def reparameterize_dirichlet(self, alpha, memory_key_padding_mask):
-
         """
-        Takes in alpha parameters and returns pi from a dirichlet distribution using approximation:
-        Inverse CDF approximation
-        Gaussian approxiation
+        Takes in alpha parameters and returns pi from a dirichlet distribution.
 
         :param alpha: [Nl,B,1]
         :param memory_key_padding_mask: Mask for the latent space [B,Nl]
@@ -116,22 +106,23 @@ class Nvib(nn.Module):
 
         # Get mask
         alpha_mask = memory_key_padding_mask + alpha.le(0)
-        alpha = torch.clamp(alpha.clone(), min=1e-8)
-        appoximation_mask = torch.gt(alpha, 0.63).float()
+        alpha = torch.clamp(alpha.clone(), min=1e-14)
 
         if self.training:
-            # Gaussian approximation or inverse cdf approximation
-            gammas = appoximation_mask * gauss_approximation(alpha) + (
-                1 - appoximation_mask
-            ) * inverse_cdf_approximation(alpha)
+            # Implicit gradients for Gamma (batch_shape [Nl, B]) each individual gamma
+            gamma_dist = torch.distributions.Gamma(alpha, torch.ones_like(alpha))
+            gammas = gamma_dist.rsample()
 
         # Testing the alphas don't have noise
         else:
-            gammas = alpha
+            thresh = nn.Threshold(0.1, 0)
+            gammas = thresh(alpha)
+            alpha_mask = memory_key_padding_mask + gammas.le(0)
+            # gammas = alpha
 
         # mask and normalise (make sure its non-zero)
         gammas.masked_fill_(alpha_mask, 0)
-        normalising_sum = torch.sum(gammas, 0).unsqueeze(0)
+        normalising_sum = torch.sum(gammas, 0).unsqueeze(0) + 1e-14
         pi = torch.div(gammas, normalising_sum)
 
         return pi
@@ -161,27 +152,103 @@ class Nvib(nn.Module):
             size=(max_length, number_samples, self.size_out), device=device
         )  # [Ns,B,H]
         z = self.prior_mu + (self.prior_var**0.5) * eps
-        z.masked_fill_(memory_key_padding_mask.T.unsqueeze(-1), 0)
+        z.masked_fill_(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
         logvar = torch.ones_like(z) * -200  # When exponentiated it will be 0
 
         # Sample from Dir((alpha1 + K0 * delta)/K0, ... )
         # When delta = 0 (Dirichlet process) Dir((alpha0/K0, ... ,alpha0/K0)
         # When delta = 1 (Full conditional prior) Dir((alpha0, ... ,alpha0)
-        K0 = torch.sum(~memory_key_padding_mask.T.unsqueeze(-1), 0)
+        K0 = torch.sum(~memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
         alphas = (
             torch.ones(size=(max_length, number_samples, 1), device=device)
             * (self.prior_alpha + (self.delta * (K0 - 1)))
             / K0
         )
-        alphas.masked_fill_(memory_key_padding_mask.T.unsqueeze(-1), 0)
-        pi = self.reparameterize_dirichlet(alphas, memory_key_padding_mask.T.unsqueeze(-1))
+        alphas.masked_fill_(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
+        pi = self.reparameterize_dirichlet(
+            alphas, memory_key_padding_mask.T.unsqueeze(-1)
+        )
 
         # This is how the decoder gets the parameters
         z_tuple = (z, pi, z, logvar)
 
         return z_tuple, memory_key_padding_mask
 
-    def forward(self, encoder_output, src_key_padding_mask):
+    def kl_gaussian(self, mu, logvar, alpha, memory_key_padding_mask, **kwargs):
+        """
+        KL Loss for the Gaussian component with expected K
+        :param mu: mean [Nl,B,H]
+        :param logvar: logged variance [Nl,B,H]
+        :param alpha: psuedo count weight [Nl,B,1]
+        :param memory_key_padding_mask: boolean mask [B,Nl]
+        :return: KL [B]
+        """
+
+        # Scaling
+        # Total number of vectors sampled
+        k0 = torch.sum(~memory_key_padding_mask.transpose(1, 0), 0)  # [B]
+        # Input length
+        n = k0 / self.kappa  # [B]
+
+        alpha = alpha.masked_fill(
+            memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0
+        )
+        alpha0_q = torch.sum(alpha.transpose(2, 0), -1)  # [1,B]
+        expected_pi = alpha.squeeze(-1) / alpha0_q  # [Nl,B]
+
+        # KL between univariate Gaussians
+        var_ratio = logvar.exp() / self.prior_var
+        t1 = (mu - self.prior_mu) ** 2 / self.prior_var
+        kl = var_ratio + t1 - 1 - var_ratio.log()
+        kl = kl.masked_fill(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
+
+        # Mean over embedding dimension
+        kl = torch.mean(kl, -1)  # [Nl,B]
+
+        # Scale and sum over sentence length dimension
+        kl = 0.5 * k0 * torch.sum(kl * expected_pi, 0)
+        kl /= n
+
+        return kl
+
+    def kl_dirichlet(self, alpha, memory_key_padding_mask, **kwargs):
+        """
+        The regularisation for the dirichlet component with expected K
+
+        :param alpha: k dimensional psuedo counts [Nl,B,1]
+        :param memory_key_padding_mask: boolean mask [B,Nl]
+        :return: Kl [B]
+
+        Nota Bene: digamma and lgamma cannot be zero
+        """
+
+        # Total number of vectors sampled
+        k0 = torch.sum(~memory_key_padding_mask.transpose(1, 0), 0)  # [B]
+        # Input length
+        n = k0 / self.kappa  # [B]
+        # Conditional prior lower bound. Sentence length without prior
+        lowerBound = self.delta * (n - 1)
+
+        # Sum the alphas
+        alpha = alpha.masked_fill(
+            memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0
+        )
+        alpha0_q = torch.sum(alpha, 0).squeeze(-1).to(torch.float64)  # [B]
+        alpha0_p = (torch.ones_like(alpha0_q) * (self.prior_alpha + lowerBound)).to(
+            torch.float64
+        )  # [B]
+
+        kl = (
+            torch.lgamma(alpha0_q)
+            - torch.lgamma(alpha0_p)
+            + (alpha0_q - alpha0_p)
+            * (-torch.digamma(alpha0_q) + torch.digamma(alpha0_q / k0))
+            + k0 * (torch.lgamma(alpha0_p / k0) - torch.lgamma(alpha0_q / k0))
+        ) / n
+
+        return kl.to(torch.float32)
+
+    def forward(self, encoder_output, src_key_padding_mask, alpha_skip=None):
         """
         The latent layer for NVIB. Notice length comes in as NS and exits Nl (Ns+1) for the prior
         :param encoder_output:[Ns,B,H]
@@ -196,32 +263,51 @@ class Nvib(nn.Module):
 
 
         """
-
         # Project to mean, log variance and log alpha
         mu = self.mu_proj(encoder_output)
         logvar = self.logvar_proj(encoder_output)
-        alpha = self.relu_activation(self.alpha_proj(encoder_output))
+        # Alpha skip connection in log space
+        if alpha_skip is not None:
+            alpha = self.alpha_activation(
+                self.alpha_proj(encoder_output) + torch.log(alpha_skip[1:, :, :])
+            )
+        else:
+            alpha = self.alpha_activation(self.alpha_proj(encoder_output))
 
         # Unknowns
-        unknown_mu = torch.ones_like(mu, device=mu.device)[0, :, :].unsqueeze(0) * self.prior_mu
-        unknown_logvar = torch.ones_like(logvar, device=logvar.device)[0, :, :].unsqueeze(
-            0
-        ) * math.log(self.prior_var)
+        unknown_mu = (
+            self.prior_mu.unsqueeze(0)
+            .unsqueeze(0)
+            .repeat(1, mu.shape[1], 1)
+            .to(self.device)
+        )  # [1,B,H]
+        unknown_logvar = (
+            torch.log(self.prior_var)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .repeat(1, logvar.shape[1], 1)
+        ).to(
+            self.device
+        )  # [1,B,H]
         unknown_alpha = (
-            torch.ones_like(alpha, device=alpha.device)[0, :, :].unsqueeze(0) * self.prior_alpha
-        )
+            self.prior_alpha.unsqueeze(0).unsqueeze(0).repeat(1, alpha.shape[1], 1)
+        ).to(
+            self.device
+        )  # [1,B,1]
+
         mu = torch.cat((unknown_mu, mu), 0)
         logvar = torch.cat((unknown_logvar, logvar), 0)
         alpha = torch.cat((unknown_alpha, alpha), 0)
 
         # Include mask for unknowns
-        mask = src_key_padding_mask.T.unsqueeze(-1)
-        unknown_mask = torch.zeros_like(mask, dtype=bool, device=mask.device)[0, :, :].unsqueeze(0)
+        mask = src_key_padding_mask.transpose(1, 0).unsqueeze(-1)
+        unknown_mask = torch.zeros_like(mask, dtype=bool, device=mask.device)[
+            0, :, :
+        ].unsqueeze(0)
         mask = torch.cat((unknown_mask, mask), 0)
 
         # Multi sample
         if self.training:
-
             Nl, B, H = mu.shape  # [Nl,B,1]
 
             # Reparameterise component
@@ -230,8 +316,12 @@ class Nvib(nn.Module):
 
             # Repeat for multisampling
             mu = mu.view(1, Nl, B, H).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,H]
-            logvar = logvar.view(1, Nl, B, H).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,H]
-            mask = mask.view(1, Nl, B, 1).repeat(self.kappa, 1, 1, 1)  # [kappa * Nl,B,1]
+            logvar = logvar.view(1, Nl, B, H).repeat(
+                self.kappa, 1, 1, 1
+            )  # [kappa,Nl,B,H]
+            mask = mask.view(1, Nl, B, 1).repeat(
+                self.kappa, 1, 1, 1
+            )  # [kappa * Nl,B,1]
             alpha = alpha.view(1, Nl, B, 1).repeat(self.kappa, 1, 1, 1) / self.kappa
 
             # Reparameterise
@@ -252,19 +342,17 @@ class Nvib(nn.Module):
             z = self.reparameterize_gaussian(mu, logvar)
             pi = self.reparameterize_dirichlet(alpha, mask)
 
-        # mask the parameters
-        alpha.masked_fill_(mask, 0)
-        z.masked_fill_(mask, 0)
-        mu.masked_fill_(mask, 0)
-        logvar.masked_fill_(mask, 0)
-
         # Transform back [B,Ns]
-        memory_key_padding_mask = mask.T.squeeze(0)
+        memory_key_padding_mask = mask.transpose(2, 0).squeeze(0)
 
         # Logging
-        avg_num_vec = torch.mean(torch.count_nonzero(alpha, dim=0).float())
-        avg_prop_vec = torch.mean(torch.count_nonzero(alpha, dim=0) / torch.sum(~mask, 0))
-        avg_alpha0 = torch.mean(torch.sum(alpha, 0))
+        avg_num_vec = torch.mean(
+            torch.count_nonzero(pi.masked_fill(mask, 0), dim=0).float()
+        )
+        avg_prop_vec = torch.mean(
+            torch.count_nonzero(pi.masked_fill(mask, 0), dim=0) / torch.sum(~mask, 0)
+        )
+        avg_alpha0 = torch.mean(torch.sum(alpha.masked_fill(mask, 0), 0))
 
         # This is how the decoder gets the parameters
         z_tuple = (z, pi, mu, logvar)
