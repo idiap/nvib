@@ -18,7 +18,7 @@ Nonparametric Variational Information Bottleneck (NVIB)
 The NVIB Python package containing the NVIB layer and the Denoising attention module. This is the package for the papers:
 
 - `A Variational AutoEncoder for Transformers with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=6QkjC_cs03X>`_
-- `Learning to Abstract with Nonparametric Variational Information Bottleneck <https://arxiv.org/abs/2310.17284>`_
+- `Learning to Abstract with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=vU0KbvQ91x>`_
 
 Please cite the original authors for their work in any publication(s) that uses this work:
 
@@ -32,14 +32,13 @@ Please cite the original authors for their work in any publication(s) that uses 
     url={https://openreview.net/forum?id=6QkjC_cs03X}
     }
 
-    @misc{behjati2023learning,
-      author={Melika Behjati and Fabio Fehr and James Henderson},
-      title={Learning to Abstract with Nonparametric Variational Information Bottleneck}, 
-      year={2023},
-      eprint={2310.17284},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2310.17284}
+    @inproceedings{
+    behjati2023learning,
+    title={Learning to Abstract with Nonparametric Variational Information Bottleneck},
+    author={Melika Behjati and Fabio James Fehr and James Henderson},
+    booktitle={The 2023 Conference on Empirical Methods in Natural Language Processing},
+    year={2023},
+    url={https://openreview.net/forum?id=vU0KbvQ91x}
     }
 
 Description
