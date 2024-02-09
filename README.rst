@@ -32,8 +32,7 @@ Please cite the original authors for their work in any publication(s) that uses 
     url={https://openreview.net/forum?id=6QkjC_cs03X}
     }
 
-    @inproceedings{
-    behjati2023learning,
+    @inproceedings{behjati2023learning,
     title={Learning to Abstract with Nonparametric Variational Information Bottleneck},
     author={Melika Behjati and Fabio James Fehr and James Henderson},
     booktitle={The 2023 Conference on Empirical Methods in Natural Language Processing},
