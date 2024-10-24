@@ -51,8 +51,6 @@ Requirements
 
 - Python 3.9
 - PyTorch 2.0.0
-- math 
-
 
 Installation
 ------------
