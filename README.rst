@@ -39,8 +39,7 @@ Please cite the original authors for their work in any publication(s) that uses 
     url={https://openreview.net/forum?id=vU0KbvQ91x}
     }
 
-    @inproceedings{
-    fehr2024nonparametric,
+    @inproceedings{fehr2024nonparametric,
     title={Nonparametric Variational Regularisation of Pretrained Transformers},
     author={Fabio James Fehr and James Henderson},
     booktitle={First Conference on Language Modeling},
