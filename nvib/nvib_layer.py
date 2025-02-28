@@ -1,10 +1,12 @@
 #
-# SPDX-FileCopyrightText: Copyright © 2023 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileCopyrightText: Copyright © 2025 Idiap Research Institute <contact@idiap.ch>
 #
 # SPDX-FileContributor: Fabio Fehr <fabio.fehr@idiap.ch>
 #
 # SPDX-License-Identifier: GPL-3.0-only
 #
+
+import math
 
 import torch
 import torch.nn as nn
@@ -15,6 +17,42 @@ import torch.nn as nn
 # Nl: latent length
 # B: batch size
 # H: hidden dimension
+
+
+def eye_scaled_(tensor, scale=1.0):
+    with torch.no_grad():
+        torch.eye(*tensor.shape, out=tensor, requires_grad=tensor.requires_grad).mul_(scale)
+    return tensor
+
+
+def init_vector_(tensor, init_vector):
+    with torch.no_grad():
+        tensor.copy_(init_vector)
+    return tensor
+
+
+class Quadratic(torch.nn.Module):
+    def __init__(self, size_in, size_out):
+        """
+        In the constructor we instantiate three parameters and assign them as
+        member parameters.
+        """
+        super().__init__()
+
+        self.linear = torch.nn.Linear(size_in, size_out)
+        self.quadratic = torch.nn.Linear(size_in, size_out, bias=False)
+
+        self.bias = self.linear.bias
+        self.weight_linear = self.linear.weight
+        self.weight_quadratic = self.quadratic.weight
+
+    def forward(self, x):
+        """
+        In the forward function we accept a Tensor of input data and we must return
+        a Tensor of output data. We can use Modules defined in the constructor as
+        well as arbitrary operators on Tensors.
+        """
+        return self.linear(x) + self.quadratic(x**2)
 
 
 class Exponential(nn.Module):
@@ -40,10 +78,14 @@ class Nvib(nn.Module):
         size_out,
         prior_mu=None,
         prior_var=None,
-        prior_alpha=None,
+        prior_log_alpha=None,
+        prior_log_alpha_stdev=None,
         delta=1,
         kappa=1,
         nheads=1,
+        alpha_tau=None,
+        stdev_tau=None,
+        mu_tau=None,
     ):
         super().__init__()
 
@@ -54,13 +96,16 @@ class Nvib(nn.Module):
         self.prior_mu = (prior_mu if prior_mu is not None else torch.zeros(size_in)).to(
             self.device
         )  # [H]
-        self.prior_var = (
-            prior_var if prior_var is not None else torch.ones(size_in)
-        ).to(
+        self.prior_var = (prior_var if prior_var is not None else torch.ones(size_in)).to(
             self.device
         )  # [H]
-        self.prior_alpha = (
-            prior_alpha if prior_alpha is not None else torch.ones(1)
+        self.prior_log_alpha = (
+            prior_log_alpha if prior_log_alpha is not None else torch.zeros(1)
+        ).to(
+            self.device
+        )  # [1]
+        self.prior_log_alpha_stdev = (
+            prior_log_alpha_stdev if prior_log_alpha_stdev is not None else torch.ones(1)
         ).to(
             self.device
         )  # [1]
@@ -70,11 +115,45 @@ class Nvib(nn.Module):
         # Layers for parameters
         self.size_in = size_in
         self.size_out = size_out
-        self.alpha_activation = Exponential()  # activation for alphas
+        self.d = int(size_in / nheads)  # dimension of the head
+        self.alpha_activation = Exponential()  # projection for alphas
         self.mu_proj = nn.Linear(size_in, size_out)  # Project to mean
         self.logvar_proj = nn.Linear(size_in, size_out)  # Project log variance
-        self.alpha_proj = nn.Linear(size_in, 1)  # Project to model size
-        self.d = size_in / nheads  # dimension of the head
+        self.alpha_proj = Quadratic(size_in, 1)  # Project to model size
+        self.nheads = nheads  # number of heads
+
+        # Initialisation parameters - 0 is the prior 1 is the posterior
+        self.alpha_tau = alpha_tau if alpha_tau is not None else 1
+        self.stdev_tau = stdev_tau if stdev_tau is not None else 1
+        self.mu_tau = mu_tau if mu_tau is not None else 1
+        self.init_parameters()
+
+    def init_parameters(self):
+        """
+        Initialise parameters
+        """
+        # Initialise mu projection
+        eye_scaled_(self.mu_proj.weight, self.mu_tau)
+        init_vector_(self.mu_proj.bias, self.prior_mu * (1 - self.mu_tau))
+
+        # Initialise logvar projection
+        nn.init.constant_(self.logvar_proj.weight, 0)
+        init_vector_(
+            self.logvar_proj.bias,
+            torch.log(
+                (torch.sqrt(self.prior_var) * self.stdev_tau)
+                ** 2  # Controls the standard deviation
+                + torch.finfo(self.prior_var.dtype).tiny
+            ),  # nonzero
+        )
+
+        # Initialise alpha projection
+        nn.init.constant_(self.alpha_proj.weight_quadratic, 1 / (2 * math.sqrt(self.d)))
+        nn.init.constant_(self.alpha_proj.weight_linear, 0)
+        init_vector_(
+            self.alpha_proj.bias,
+            self.prior_log_alpha_stdev * (self.alpha_tau),  # Standard deviation of log alpha
+        )
 
     def reparameterize_gaussian(self, mu, logvar):
         """
@@ -95,18 +174,14 @@ class Nvib(nn.Module):
             z = mu  # [Nl,B,H]
         return z  # [Nl,B,H]
 
-    def reparameterize_dirichlet(self, alpha, memory_key_padding_mask):
+    def reparameterize_dirichlet(self, alpha, mask):
         """
         Takes in alpha parameters and returns pi from a dirichlet distribution.
 
         :param alpha: [Nl,B,1]
-        :param memory_key_padding_mask: Mask for the latent space [B,Nl]
+        :param mask: Mask for the latent space [B,Nl]
         :return: pi [Nl,B,1]
         """
-
-        # Get mask
-        alpha_mask = memory_key_padding_mask + alpha.le(0)
-        alpha = torch.clamp(alpha.clone(), min=1e-14)
 
         if self.training:
             # Implicit gradients for Gamma (batch_shape [Nl, B]) each individual gamma
@@ -117,12 +192,10 @@ class Nvib(nn.Module):
         else:
             thresh = nn.Threshold(0.1, 0)
             gammas = thresh(alpha)
-            alpha_mask = memory_key_padding_mask + gammas.le(0)
-            # gammas = alpha
 
         # mask and normalise (make sure its non-zero)
-        gammas.masked_fill_(alpha_mask, 0)
-        normalising_sum = torch.sum(gammas, 0).unsqueeze(0) + 1e-14
+        gammas.masked_fill_(mask, 0)
+        normalising_sum = torch.sum(gammas, 0).unsqueeze(0) + torch.finfo(gammas.dtype).tiny
         pi = torch.div(gammas, normalising_sum)
 
         return pi
@@ -165,9 +238,7 @@ class Nvib(nn.Module):
             / K0
         )
         alphas.masked_fill_(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
-        pi = self.reparameterize_dirichlet(
-            alphas, memory_key_padding_mask.T.unsqueeze(-1)
-        )
+        pi = self.reparameterize_dirichlet(alphas, memory_key_padding_mask.T.unsqueeze(-1))
 
         # This is how the decoder gets the parameters
         z_tuple = (z, pi, z, logvar)
@@ -190,9 +261,7 @@ class Nvib(nn.Module):
         # Input length
         n = k0 / self.kappa  # [B]
 
-        alpha = alpha.masked_fill(
-            memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0
-        )
+        alpha = alpha.masked_fill(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
         alpha0_q = torch.sum(alpha.transpose(2, 0), -1)  # [1,B]
         expected_pi = alpha.squeeze(-1) / alpha0_q  # [Nl,B]
 
@@ -230,9 +299,7 @@ class Nvib(nn.Module):
         lowerBound = self.delta * (n - 1)
 
         # Sum the alphas
-        alpha = alpha.masked_fill(
-            memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0
-        )
+        alpha = alpha.masked_fill(memory_key_padding_mask.transpose(1, 0).unsqueeze(-1), 0)
         alpha0_q = torch.sum(alpha, 0).squeeze(-1).to(torch.float64)  # [B]
         alpha0_p = (torch.ones_like(alpha0_q) * (self.prior_alpha + lowerBound)).to(
             torch.float64
@@ -241,87 +308,88 @@ class Nvib(nn.Module):
         kl = (
             torch.lgamma(alpha0_q)
             - torch.lgamma(alpha0_p)
-            + (alpha0_q - alpha0_p)
-            * (-torch.digamma(alpha0_q) + torch.digamma(alpha0_q / k0))
+            + (alpha0_q - alpha0_p) * (-torch.digamma(alpha0_q) + torch.digamma(alpha0_q / k0))
             + k0 * (torch.lgamma(alpha0_p / k0) - torch.lgamma(alpha0_q / k0))
         ) / n
 
         return kl.to(torch.float32)
 
-    def forward(self, encoder_output, src_key_padding_mask, alpha_skip=None):
+    def forward(
+        self, encoder_output, mask, alpha_skip=None, batch_first=True, logging=False, **kwargs
+    ):
         """
         The latent layer for NVIB. Notice length comes in as NS and exits Nl (Ns+1) for the prior
-        :param encoder_output:[Ns,B,H]
-        :param src_key_padding_mask: [B,Ns]
+        :param encoder_output:[B, Ns, P]
+        :param mask: [B,Ns] Always batch first
+        :param alpha_skip: [B,Nl,heads]
+        :param batch_first: True if batch first
+        :param include_prior_component: True if including prior component - remove in autoregressive decoding
+        :param logging: True if logging metrics
         :return: A dictionary of outputs:
-                z: reparameterised from the latent layer [Nl,B,H]
-                pi: probability [Nl,B,1]
+                z: (z, pi, mu, logvar) tuple where inner z is reparameterised from the latent layer [B, Nl, P]
+                pi: probability [B,Nl,1]
                 memory_key_padding_mask: from the latent layer [B,Nl]
-                mu: means from the latent layer [Nl,B,H]
-                logvar: logged variances from the latent layer [Nl,B,H]
-                alpha: psuedo-counts from the latent layer [Nl,B,H]
+                mu: means from the latent layer [B,Nl,P]
+                logvar: logged variances from the latent layer [B, Nl, P]
+                alpha: psuedo-counts from the latent layer [B,Nl,heads]
 
 
         """
+        # If batch first, transpose.
+        if batch_first:
+            encoder_output = encoder_output.transpose(1, 0)
+            if alpha_skip is not None:
+                alpha_skip = alpha_skip.transpose(1, 0)
+
+        # Useful dimensions
+        Ns, B, H = encoder_output.shape
+        Nl = Ns + 1
+
         # Project to mean, log variance and log alpha
         mu = self.mu_proj(encoder_output)
         logvar = self.logvar_proj(encoder_output)
+
         # Alpha skip connection in log space
         if alpha_skip is not None:
-            alpha = self.alpha_activation(
-                self.alpha_proj(encoder_output) + torch.log(alpha_skip[1:, :, :])
-            )
+            log_alpha = self.alpha_proj(encoder_output) + torch.log(alpha_skip[1:, :, :])
+            alpha = self.alpha_activation(log_alpha)
         else:
-            alpha = self.alpha_activation(self.alpha_proj(encoder_output))
+            log_alpha = self.alpha_proj(encoder_output)
+            alpha = self.alpha_activation(log_alpha)
 
-        # Unknowns
-        unknown_mu = (
-            self.prior_mu.unsqueeze(0)
-            .unsqueeze(0)
-            .repeat(1, mu.shape[1], 1)
-            .to(self.device)
-        )  # [1,B,H]
-        unknown_logvar = (
-            torch.log(self.prior_var)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .repeat(1, logvar.shape[1], 1)
-        ).to(
-            self.device
-        )  # [1,B,H]
-        unknown_alpha = (
-            self.prior_alpha.unsqueeze(0).unsqueeze(0).repeat(1, alpha.shape[1], 1)
-        ).to(
-            self.device
-        )  # [1,B,1]
+        # Clamp alpha
+        # alpha = torch.clamp(alpha, min=0, max=torch.finfo(alpha.dtype).max - 1000)
+        mask = mask.transpose(1, 0).unsqueeze(-1)
+        # Unknowns are the prior [1, B, P]
+
+        unknown_mu = torch.ones_like(mu[0:1, :, :], device=self.device) * self.prior_mu
+        unknown_logvar = torch.ones_like(logvar[0:1, :, :], device=self.device) * torch.log(
+            self.prior_var
+        )
+        # Size is [1, B, 1]
+        unknown_log_alpha = (
+            torch.ones_like(alpha[0:1, :, :], device=self.device) * self.prior_log_alpha
+        )
 
         mu = torch.cat((unknown_mu, mu), 0)
         logvar = torch.cat((unknown_logvar, logvar), 0)
-        alpha = torch.cat((unknown_alpha, alpha), 0)
+        alpha = torch.cat((self.alpha_activation(unknown_log_alpha), alpha), 0)
+        log_alpha = torch.cat((unknown_log_alpha, log_alpha), 0)
 
-        # Include mask for unknowns
-        mask = src_key_padding_mask.transpose(1, 0).unsqueeze(-1)
-        unknown_mask = torch.zeros_like(mask, dtype=bool, device=mask.device)[
-            0, :, :
-        ].unsqueeze(0)
+        # Include mask for unknowns [Nl,B,1]
+        unknown_mask = torch.zeros_like(mask[0:1, :, :], dtype=bool, device=self.device)
         mask = torch.cat((unknown_mask, mask), 0)
 
         # Multi sample
-        if self.training:
-            Nl, B, H = mu.shape  # [Nl,B,1]
-
+        if self.kappa > 1:
             # Reparameterise component
             rho = self.reparameterize_dirichlet(alpha, mask)
             rho = rho.view(1, Nl, B, 1).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,1]
 
             # Repeat for multisampling
-            mu = mu.view(1, Nl, B, H).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,H]
-            logvar = logvar.view(1, Nl, B, H).repeat(
-                self.kappa, 1, 1, 1
-            )  # [kappa,Nl,B,H]
-            mask = mask.view(1, Nl, B, 1).repeat(
-                self.kappa, 1, 1, 1
-            )  # [kappa * Nl,B,1]
+            mu = mu.view(1, Nl, B, H).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,P]
+            logvar = logvar.view(1, Nl, B, H).repeat(self.kappa, 1, 1, 1)  # [kappa,Nl,B,P]
+            mask = mask.view(1, Nl, B, 1).repeat(self.kappa, 1, 1, 1)  # [kappa * Nl,B,1]
             alpha = alpha.view(1, Nl, B, 1).repeat(self.kappa, 1, 1, 1) / self.kappa
 
             # Reparameterise
@@ -333,8 +401,8 @@ class Nvib(nn.Module):
 
             # Reshape
             mask = mask.view(Nl * self.kappa, B, 1)  # [kappa*Nl,B,1]
-            mu = mu.view(Nl * self.kappa, B, H)  # [kappa*Nl,B,H]
-            logvar = logvar.view(Nl * self.kappa, B, H)  # [kappa*Nl,B,H]
+            mu = mu.view(Nl * self.kappa, B, H)  # [kappa*Nl,B,P]
+            logvar = logvar.view(Nl * self.kappa, B, H)  # [kappa*Nl,B,P]
             alpha = alpha.view(Nl * self.kappa, B, 1)  # [kappa*Nl,B,1]
 
         else:
@@ -342,29 +410,43 @@ class Nvib(nn.Module):
             z = self.reparameterize_gaussian(mu, logvar)
             pi = self.reparameterize_dirichlet(alpha, mask)
 
-        # Transform back [B,Ns]
-        memory_key_padding_mask = mask.transpose(2, 0).squeeze(0)
+        # Reshape for batch first
+        if batch_first:
+            z = z.transpose(1, 0)
+            pi = pi.transpose(1, 0)
+            mu = mu.transpose(1, 0)
+            logvar = logvar.transpose(1, 0)
+            alpha = alpha.transpose(1, 0)
+            log_alpha = log_alpha.transpose(1, 0)
 
         # Logging
-        avg_num_vec = torch.mean(
-            torch.count_nonzero(pi.masked_fill(mask, 0), dim=0).float()
-        )
-        avg_prop_vec = torch.mean(
-            torch.count_nonzero(pi.masked_fill(mask, 0), dim=0) / torch.sum(~mask, 0)
-        )
-        avg_alpha0 = torch.mean(torch.sum(alpha.masked_fill(mask, 0), 0))
+        if logging:
+            avg_num_vec = torch.mean(torch.count_nonzero(pi.masked_fill(mask, 0), dim=0).float())
+            avg_prop_vec = torch.mean(
+                torch.count_nonzero(pi.masked_fill(mask, 0), dim=0) / torch.sum(~mask, 0)
+            )
+            avg_alpha0 = torch.mean(torch.sum(alpha.masked_fill(mask, 0), 0))
 
-        # This is how the decoder gets the parameters
-        z_tuple = (z, pi, mu, logvar)
-
-        return {
-            "z": z_tuple,
-            "pi": pi,
-            "memory_key_padding_mask": memory_key_padding_mask,
-            "mu": mu,
-            "logvar": logvar,
-            "alpha": alpha,
-            "avg_num_vec": float(avg_num_vec),
-            "avg_prop_vec": float(avg_prop_vec),
-            "avg_alpha0": float(avg_alpha0),
-        }
+            return {
+                "z": (z, pi, mu, logvar),  # This is how the decoder gets the parameters
+                "pi": pi,
+                "memory_key_padding_mask": mask.transpose(2, 0).squeeze(0),  # [B,Nl]
+                "mu": mu,
+                "logvar": logvar,
+                "alpha": alpha,
+                "log_alpha": log_alpha,
+                "avg_num_vec": float(avg_num_vec),
+                "avg_prop_vec": float(avg_prop_vec),
+                "avg_alpha0": float(avg_alpha0),
+            }
+        # No logging
+        else:
+            return {
+                "z": (z, pi, mu, logvar),  # This is how the decoder gets the parameters
+                "pi": pi,
+                "memory_key_padding_mask": mask.transpose(2, 0).squeeze(0),  # [B,Nl]
+                "mu": mu,
+                "logvar": logvar,
+                "alpha": alpha,
+                "log_alpha": log_alpha,
+            }

@@ -1,0 +1,17 @@
+#
+# SPDX-FileCopyrightText: Copyright © 2023 Idiap Research Institute <contact@idiap.ch>
+#
+# SPDX-FileContributor: Fabio Fehr <fabio.fehr@idiap.ch>
+#
+# SPDX-License-Identifier: GPL-3.0-only
+#
+
+name: nvib
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10 # Free BSD - https://www.python.org/
+  - pytorch::pytorch=2.0.0 # BSD3 - https://pytorch.org/
+  - pytorch::pytorch-cuda=11.8 # BSD3 - https://pytorch.org/
+  - nvidia::cuda=11.8 # MIT - https://docs.nvidia.com/cuda/eula/index.html
+  - pytest # MIT - https://docs.pytest.org/en/7.1.x/index.html
