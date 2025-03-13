@@ -99,9 +99,8 @@ Project status
 Development is ongoing and soon to have implementations for: 
 
 - Causal self attention
-- FlashAttention (HazyResearch)
-- Memory-Efficient Attention (xFormers)
-- Native C++ implementation
+- Cuda kernels for NVIB
+
 
 Python Usage
 -------------------
@@ -124,9 +123,9 @@ For running the following examples:
 
     Ns, Nt, B, P, nheads = 10, 6, 2, 512, 8
     number_samples = 3
-    encoder_output = torch.rand(Ns,B,P)
+    encoder_output = torch.rand(B,Ns,P)
     src_key_padding_mask = torch.zeros((B,Ns),dtype=bool)
-    tgt = torch.rand(Nt,B,P)
+    tgt = torch.rand(B,Nt,P)
     tgt_key_padding_mask = torch.zeros((B,Nt),dtype=bool)
     memory_key_padding_mask = torch.zeros((number_samples,Ns),dtype=bool)
     device = "cpu"
@@ -141,8 +140,9 @@ Initialise the NVIB layer (Source length = :math:`N_s`, embedding size = :math:`
 - `size_out` The embedding size output (typically the same)
 - `prior_mu` Prior for Gaussian means :math:`\mu^p`
 - `prior_var` Prior for Gaussian variance :math:`(\sigma^2)^p`
-- `prior_alpha` Prior for Dirichlet psuedo-counts :math:`\alpha_0^p`
-- `delta` Conditional prior :math:`\alpha^\Delta` - Proportion alpha0 you regularise towards 0 is no conidtional prior or :math:`\delta` >0 is the prior 
+- `prior_log_alpha` Logged Prior for Dirichlet psuedo-counts :math:`\alpha_0^p`
+- `prior_log_alpha_stdev` Logged standard deviation for prior for Dirichlet psuedo-counts :math:`\alpha_0^p`
+- `delta` Conditional prior :math:`\alpha^\Delta`
 - `kappa` Number of samples per component :math:`\kappa^\Delta`
 - `nheads` Number of heads for the attention module
 - `alpha_tau` Temperature parameter for the Dirichlet distribution where 0 is the posterior and 1 is the prior
@@ -160,7 +160,8 @@ Initialise the NVIB layer (Source length = :math:`N_s`, embedding size = :math:`
                   size_out=P,
                   prior_mu=None,
                   prior_var=None,
-                  prior_alpha=None,
+                  prior_log_alpha=None,
+                  prior_log_alpha_stdev=None,
                   delta=1,
                   kappa=1,
                   nheads=nheads,
@@ -169,7 +170,7 @@ Initialise the NVIB layer (Source length = :math:`N_s`, embedding size = :math:`
                   mu_tau=None,
                   )
 
-Run the forward of the layer with encoder_output size :math:`(N_s, B, P)` and boolean mask size :math:`(B, N_s)` where True masks the
+Run the forward of the layer with encoder_output size :math:`(B, N_s, P)` and boolean mask size :math:`(B, N_s)` where True masks the
 token. In self-attention layers we could include the `alpha_skip` parameter which accumulates the :math:`\alpha` from the previous layer
 
 
@@ -189,11 +190,11 @@ The dictionary returned is of the form:
 where `z` is a tuple containing `(z, pi, mu, logvar)` variables. This tuple is what is passed to
 the `DenoisingMultiheadAttention` forward function such that it may access the parameters.
 
-- The `z` within the tuple is the Gaussian component vectors. :math:`((N_s+1) \times \kappa^\Delta, B, P)`
-- `alpha` is the psuedo-counts. :math:`((N_s+1) \times \kappa^\Delta, B, 1)`
-- `pi` is the Dirichlet probability reparameterised from psuedo-counts :math:`((N_s+1) \times \kappa^\Delta, B, 1)`
-- `mu` is the means of the Gaussian components. :math:`((N_s+1) \times \kappa^\Delta, B, P)`
-- `logvar` is the logged variance of the Gaussian components. :math:`((N_s+1) \times \kappa^\Delta, B, P)`
+- The `z` within the tuple is the Gaussian component vectors. :math:`(B, (N_s+1) \times \kappa^\Delta, P)`
+- `alpha` is the psuedo-counts. :math:`(B, (N_s+1) \times \kappa^\Delta, 1)`
+- `pi` is the Dirichlet probability reparameterised from psuedo-counts :math:`(B, (N_s+1) \times \kappa^\Delta, 1)`
+- `mu` is the means of the Gaussian components. :math:`(B, (N_s+1) \times \kappa^\Delta, P)`
+- `logvar` is the logged variance of the Gaussian components. :math:`(B, (N_s+1) \times \kappa^\Delta, P)`
 - `memory_key_padding_mask` is the encoders boolean attention mask. :math:`(B, (N_s+1) \times \kappa^\Delta)`
 - `avg_num_vec` is the number of non-zero psuedo-counts averaged over the batch (used for logging)
 - `avg_prop_vec` is the proportion of non-zero psuedo-counts averaged over the batch (used for logging)
@@ -228,11 +229,13 @@ This duplicates and augments the `multi_head_attention_forward` function and `mu
 
     decoder_layer = nn.TransformerDecoderLayer(d_model=P,
                                             dim_feedforward=4*P,
-                                            nhead=nhead,
-                                            dropout=0.1)
+                                            nhead=nheads,
+                                            dropout=0.1,
+                                            batch_first=True
+                                            )
 
     transformer_decoder = nn.TransformerDecoder(decoder_layer,
-                                                num_layers=nhead)
+                                                num_layers=nheads)
 
 Set each layer which interfaces encoder and decoder to Denoising Attention:
 
@@ -241,9 +244,11 @@ Set each layer which interfaces encoder and decoder to Denoising Attention:
 
     for layer_num, layer in enumerate(transformer_decoder.layers):
         layer.multihead_attn = DenoisingMultiheadAttention(embed_dim=P,
-                                                        num_heads=nhead,
+                                                        num_heads=nheads,
                                                         dropout=0.1,
-                                                        bias=False)
+                                                        bias=False,
+                                                        batch_first=True
+                                                        )
 
 
 Now the forward for this decoder: **Note:** It assumes keys and values from the encoder output are a
@@ -254,9 +259,9 @@ tuple `(z, pi, mu, logvar)` where the `z` within the tuple was the original inpu
 
     
     output = transformer_decoder(tgt=tgt,
-                                memory=latent_dict["z"],
+                                memory=latent_dict_0["z"],
                                 tgt_key_padding_mask=tgt_key_padding_mask,
-                                memory_key_padding_mask=latent_dict["memory_key_padding_mask"])
+                                memory_key_padding_mask=latent_dict_0["memory_key_padding_mask"])
 
 
 Self Attention
