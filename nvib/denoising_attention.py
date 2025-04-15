@@ -1026,8 +1026,7 @@ def denoising_multi_head_attention_forward(
         # Project the multihead query and bias into the p space from the e (d/head) space
         projected_u = torch.einsum("bhme, hep -> bhmp", q_reshape, mh_w_k)
         projected_bias = torch.einsum("bhme, hep -> bhmp", q_reshape, mh_b_k)
-
-        breakpoint()
+        
         attn_output, attn_output_weights = denoising_attention_eval(
             projected_u,
             projected_bias,
