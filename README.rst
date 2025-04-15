@@ -15,28 +15,22 @@ Nonparametric Variational Information Bottleneck (NVIB)
 
 The NVIB Python package containing the NVIB layer and the Denoising attention module. This is the package for the papers:
 
-- [Tag v1.0] `A Variational AutoEncoder for Transformers with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=6QkjC_cs03X>`_ (ICLR 2023)
-- [Tag v2.0] `Learning to Abstract with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=vU0KbvQ91x>`_ (EMNLP 2023)
+- [Tag v4.0] Coming soon! `Fine-Tuning Pretrained Models with NVIB for Improved Generalisation <https://openreview.net/forum?id=eX0VFgG4IS`_ (ICLR 2025)
 - [Tag v3.0] `Nonparametric Variational Regularisation of Pretrained Transformers <https://openreview.net/forum?id=Zu8OWNUC0u#discussion>`_ (COLM 2024)
+- [Tag v2.0] `Learning to Abstract with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=vU0KbvQ91x>`_ (EMNLP 2023)
+- [Tag v1.0] `A Variational AutoEncoder for Transformers with Nonparametric Variational Information Bottleneck <https://openreview.net/forum?id=6QkjC_cs03X>`_ (ICLR 2023)
 
 Please cite the original authors for their work in any publication(s) that uses this work:
 
 .. code:: bib
 
-    @inproceedings{henderson23_nvib,
-    author    = {James Henderson and Fabio Fehr},
-    title     = {{A VAE for Transformers with Nonparametric Variational Information Bottleneck}},
-    year      = {2023},
-    booktitle = {International Conference on Learning Representations},
-    url={https://openreview.net/forum?id=6QkjC_cs03X}
-    }
-
-    @inproceedings{behjati2023learning,
-    title={Learning to Abstract with Nonparametric Variational Information Bottleneck},
-    author={Melika Behjati and Fabio James Fehr and James Henderson},
-    booktitle={The 2023 Conference on Empirical Methods in Natural Language Processing},
-    year={2023},
-    url={https://openreview.net/forum?id=vU0KbvQ91x}
+    @inproceedings{
+    fehr2025finetuning,
+    title={Fine-Tuning Pretrained Models with {NVIB} for Improved Generalisation},
+    author={Fabio James Fehr and Alina Elena Baia and Xiaoguang Chang and Andrei Catalin Coman and Karl El Hajal and Dina El Zein and Shashi Kumar and Juan Pablo Zuluaga Gomez and Andrea Cavallaro and Damien Teney and James Henderson},
+    booktitle={Workshop on Spurious Correlation and Shortcut Learning: Foundations and Solutions},
+    year={2025},
+    url={https://openreview.net/forum?id=eX0VFgG4IS}
     }
 
     @inproceedings{fehr2024nonparametric,
@@ -46,6 +40,23 @@ Please cite the original authors for their work in any publication(s) that uses 
     year={2024},
     url={https://openreview.net/forum?id=Zu8OWNUC0u}
     }
+
+    @inproceedings{behjati2023learning,
+    title={Learning to Abstract with Nonparametric Variational Information Bottleneck},
+    author={Melika Behjati and Fabio James Fehr and James Henderson},
+    booktitle={Findings of the Association for Computational Linguistics: EMNLP 2023},
+    year={2023},
+    url={https://openreview.net/forum?id=vU0KbvQ91x}
+    }
+
+    @inproceedings{henderson23_nvib,
+    author    = {James Henderson and Fabio James Fehr},
+    title     = {{A VAE for Transformers with Nonparametric Variational Information Bottleneck}},
+    year      = {2023},
+    booktitle = {International Conference on Learning Representations},
+    url={https://openreview.net/forum?id=6QkjC_cs03X}
+    }
+
 
 
 Description
@@ -98,6 +109,7 @@ Project status
 
 Development is ongoing and soon to have implementations for: 
 
+- Pretrained model implemetations with NVIB and denoising attention
 - Causal self attention
 - Cuda kernels for NVIB
 
